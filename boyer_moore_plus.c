@@ -1,135 +1,82 @@
-/*===================================================================
-    boyer_moore_plus.c
-    Boyer–Moore search using both:
-      - Bad-character rule
-      - Good-suffix rule 
-
-    prototype:
-      char *boyer_moore_plus(char *text, size_t text_len,
-                             const char *pattern, size_t pat_len);
-
-    Behavior:
-      - returns pointer to first occurrence of pattern inside text
-      - returns NULL on invalid input or if no match found
-      - pattern/text are treated as raw bytes (text may not be null-terminated)
-===================================================================*/
-#include<stdio.h>
-#include<stdlib.h>
+#include "search.h"
 #include <stddef.h>
 #include <string.h>
-#include "search.h"
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/types.h>
 
-// Build the bad-character lookup table for Boyer-Moore.
-// For each possible byte value (0–255), store the last index where it
-// appears in the pattern. If the character does not appear, keep -1.
-static void preprocess_badchar(const unsigned char *pat, size_t m, int badchar[256])
-{
-    for (int i = 0; i < 256; ++i) badchar[i] = -1;
-    for (size_t i = 0; i < m; ++i) {
-        badchar[pat[i]] = (int)i;
-    }
+#define ALPHABET_SIZE 256
+
+// Bad character table
+static void build_bad_char(const char *pattern, size_t pat_len, int bad_char[ALPHABET_SIZE]) {
+    for (int i = 0; i < ALPHABET_SIZE; i++)
+        bad_char[i] = -1;
+    for (size_t i = 0; i < pat_len; i++)
+        bad_char[(unsigned char)pattern[i]] = (int)i;
 }
 
-/* Preprocess strong good-suffix rule.
-   Produces:
-     - suffix[i]: length of longest suffix of pat[0..i] that is also a suffix of pat
-     - bmGs[i]: shift distance when mismatch occurs at position i (0-based)
-   Algorithm adapted from standard Boyer-Moore preprocessing.
-*/
-static void preprocess_good_suffix(const unsigned char *pat, size_t m, int *suffix, int *bmGs)
-{
-    // 1) compute suffixes 
-    suffix[m - 1] = (int)m;
-    int g = (int)m - 1;
-    int f = 0;
-    for (int i = (int)m - 2; i >= 0; --i) {
-        if (i > g && suffix[i + (int)m - 1 - f] < i - g) {
-            suffix[i] = suffix[i + (int)m - 1 - f];
-        } else {
-            if (i < g) g = i;
-            f = i;
-            while (g >= 0 && pat[g] == pat[g + (int)m - 1 - f]) --g;
-            suffix[i] = f - g;
-        }
+// Good suffix preprocessing
+static void build_good_suffix(const char *pattern, size_t pat_len, int *shift) {
+    int i = (int)pat_len;
+    int j = (int)pat_len + 1;
+    int *border_pos = (int *)malloc((pat_len + 1) * sizeof(int));
+
+    border_pos[i] = j;
+
+    while (i > 0) {
+        while (j <= (int)pat_len && pattern[i - 1] != pattern[j - 1])
+            j = border_pos[j];
+        i--;
+        j--;
+        border_pos[i] = j;
     }
 
-    // 2) compute bmGs (initial fill with m) 
-    for (size_t i = 0; i < m; ++i) bmGs[i] = (int)m;
+    for (size_t k = 0; k <= (size_t)pat_len; k++)
+        shift[k] = (int)pat_len;
 
-    // 3) case for suffixes that are also prefix 
-    int j = 0;
-    for (int i = (int)m - 1; i >= 0; --i) {
-        if (suffix[i] == i + 1) {
-            for (; j < (int)m - 1 - i; ++j) {
-                if (bmGs[j] == (int)m)
-                    bmGs[j] = (int)m - 1 - i;
-            }
-        }
+    j = border_pos[0];
+    for (ssize_t i = 0; i < (ssize_t)pat_len; i++) {
+        if (shift[i] == (int)pat_len)
+            shift[i] = j;
+        if (i == j)
+            j = border_pos[j];
     }
 
-    // 4) remaining positions 
-    for (int i = 0; i <= (int)m - 2; ++i) {
-        int idx = (int)m - 1 - suffix[i];
-        if (idx >= 0 && idx < (int)m)
-            bmGs[idx] = (int)m - 1 - i;
-    }
+    free(border_pos);
 }
 
-char *boyer_moore_plus(char *text, size_t text_len,
-                       const char *pattern, size_t pat_len)
-{
-    // sanity checks 
-    if (text == NULL || pattern == NULL)
-        return NULL;
-    if (pat_len == 0 || pat_len > text_len)
+char *boyer_moore_plus(char *text, size_t text_len, const char *pattern, size_t pat_len) {
+    if (pat_len == 0 || text_len < pat_len)
         return NULL;
 
-    size_t n = text_len;
-    size_t m = pat_len;
+    int bad_char[ALPHABET_SIZE];
+    build_bad_char(pattern, pat_len, bad_char);
 
-    // treat pattern/text as unsigned bytes for indexing 
-    const unsigned char *pat = (const unsigned char *)pattern;
-    const unsigned char *txt = (const unsigned char *)text;
+    int *good_suffix = (int *)malloc(pat_len * sizeof(int));
+    if (!good_suffix)
+        return NULL;
 
-    // bad-character table 
-    int badchar[256];
-    preprocess_badchar(pat, m, badchar);
+    build_good_suffix(pattern, pat_len, good_suffix);
 
-    // good-suffix tables (suffix and bmGs) 
-    int *suffix = (int *)malloc(sizeof(int) * (size_t)m);
-    if (!suffix) return NULL; /* malloc failure */
-    int *bmGs = (int *)malloc(sizeof(int) * (size_t)m);
-    if (!bmGs) { free(suffix); return NULL; }
+    size_t s = 0; // shift of pattern with respect to text
 
-    preprocess_good_suffix(pat, m, suffix, bmGs);
+    while (s <= text_len - pat_len) {
+        ssize_t j = (ssize_t)pat_len - 1;
 
-    /* Search loop */
-    size_t s = 0; // shift of the pattern with respect to text 
-    while (s + m <= n) {
-        int j = (int)m - 1;
-
-        // compare from right to left 
-        while (j >= 0 && pat[j] == txt[s + (size_t)j]) --j;
+        // Compare from right to left
+        while (j >= 0 && pattern[j] == text[s + j])
+            j--;
 
         if (j < 0) {
-            // match found at shift s 
-            free(suffix);
-            free(bmGs);
-            return text + s;
+            free(good_suffix);
+            return text + s; // match found
         } else {
-            unsigned char bc = txt[s + (size_t)j];
-            int last = badchar[bc]; /* -1 if not in pattern */
-            int bc_shift = j - last;
-            if (bc_shift < 1) bc_shift = 1;
-
-            int gs_shift = bmGs[j]; //good-suffix suggested shift 
-
-            int shift = bc_shift > gs_shift ? bc_shift : gs_shift;
-            s += (size_t)shift;
+            int bc_shift = j - bad_char[(unsigned char)text[s + j]];
+            int gs_shift = good_suffix[j];
+            s += (bc_shift > gs_shift) ? bc_shift : gs_shift;
         }
     }
 
-    free(suffix);
-    free(bmGs);
-    return NULL; // not found 
+    free(good_suffix);
+    return NULL; // no match
 }
